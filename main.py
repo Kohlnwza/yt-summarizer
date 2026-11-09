@@ -1,16 +1,20 @@
 import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-app = FastAPI(
-    title="YouTube Summarizer API",
-    description="API สำหรับสรุปเนื้อหาวิดีโอ YouTube ด้วย Gemini",
-    version="1.0.0"
+app = FastAPI(title="YouTube Summarizer API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ดึง API Key จาก Environment Variable
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -27,7 +31,7 @@ def summarize_youtube_video(req: SummarizeRequest):
     
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.5-flash-lite',
             contents=[
                 types.Part.from_uri(
                     file_uri=req.video_url,
