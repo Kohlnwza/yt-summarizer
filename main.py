@@ -9,8 +9,9 @@ from google import genai
 from google.genai import types
 import yt_dlp
 
-app = FastAPI(title="Multi-Platform Video Summarizer", version="2.0.0")
+app = FastAPI(title="Multi-Platform Video Summarizer API", version="2.0.0")
 
+# เปิดสิทธิ์ CORS ให้ LangMind สามารถส่งคำขอเข้ามาได้
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ดึง Gemini API Key จาก Environment Variable บน Render
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -28,73 +30,108 @@ class SummarizeRequest(BaseModel):
 class SummarizeResponse(BaseModel):
     summary: str
 
-def download_audio(url: str, output_path: str):
-    """ดาวน์โหลดเฉพาะเสียงจาก TikTok, FB, IG, หรือ YouTube"""
+def download_audio_safe(url: str, output_path: str):
+    """
+    ดาวน์โหลดเฉพาะเสียงจาก TikTok, Facebook, Instagram 
+    พร้อมตั้งค่า Headers เลียนแบบเบราว์เซอร์มือถือเพื่อป้องกันการบล็อก
+    """
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.tiktok.com/',
+        },
+        'extract_flat': False,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
+def summarize_with_gemini(contents_payload: list) -> str:
+    """เรียกประมวลผล Gemini พร้อมระบบสลับโมเดลอัตโนมัติหากติด 503"""
+    models = ['gemini-3.5-flash-lite', 'gemini-3.8-flash']
+    last_err = None
+
+    for model_name in models:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents_payload
+                )
+                return response.text
+            except Exception as e:
+                last_err = e
+                err_text = str(e)
+                print(f"[{model_name}] attempt {attempt + 1} failed: {err_text}")
+                if "503" in err_text or "UNAVAILABLE" in err_text:
+                    time.sleep(2)
+                    continue
+                break
+
+    raise last_err
+
 @app.get("/")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "Multi-Platform Summarizer API is running"}
 
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize_video(req: SummarizeRequest):
     if not req.video_url:
         raise HTTPException(status_code=400, detail="กรุณาระบุ URL วิดีโอ")
 
-    url = req.video_url.lower()
-    
-    # 1. กรณีเป็น YouTube: ส่ง URL ตรงให้ Gemini ได้ทันที
-    if "youtube.com" in url or "youtu.be" in url:
+    url = req.video_url.strip()
+    url_lower = url.lower()
+    prompt_text = "สรุปประเด็นสำคัญของเนื้อหานี้เป็นภาษาไทยอย่างกระชับ ชัดเจน แยกเป็นหัวข้อและข้อย่อยให้อ่านเข้าใจง่าย"
+
+    # กรณีที่ 1: เป็นคลิป YouTube (ประมวลผลผ่าน URI ได้โดยตรง ไม่ต้องโหลดไฟล์)
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
         try:
-            response = client.models.generate_content(
-                model='gemini-3.5-flash-lite',
-                contents=[
-                    types.Part.from_uri(file_uri=req.video_url, mime_type="video/*"),
-                    "สรุปประเด็นสำคัญของคลิปนี้เป็นภาษาไทยอย่างกระชับ เข้าใจง่าย และแยกเป็นข้อๆ"
-                ]
-            )
-            return SummarizeResponse(summary=response.text)
+            summary = summarize_with_gemini([
+                types.Part.from_uri(file_uri=url, mime_type="video/*"),
+                prompt_text
+            ])
+            return SummarizeResponse(summary=summary)
         except Exception as e:
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"YouTube Error: {str(e)}")
 
-    # 2. กรณีเป็น TikTok, Facebook, Instagram: ดึงไฟล์เสียงแล้วส่งให้ Gemini
-    temp_filename = f"/tmp/{uuid.uuid4()}.m4a"
-    uploaded_file = None
+    # กรณีที่ 2: TikTok, Facebook Reels, Instagram Reels
+    temp_file = f"/tmp/{uuid.uuid4()}.m4a"
+    gemini_file = None
 
     try:
-        # ดาวน์โหลดเสียงจากแพลตฟอร์ม
-        download_audio(req.video_url, temp_filename)
-        
-        # อัปโหลดไฟล์เสียงเข้า Gemini File API
-        uploaded_file = client.files.upload(file=temp_filename)
-        
-        # ส่งให้โมเดลประมวลผล
-        response = client.models.generate_content(
-            model='gemini-3.5-flash-lite',
-            contents=[
-                uploaded_file,
-                "สรุปประเด็นสำคัญจากเสียงพูดในคลิปนี้เป็นภาษาไทยอย่างกระชับ ชัดเจน และแยกเป็นข้อๆ"
-            ]
-        )
-        return SummarizeResponse(summary=response.text)
+        # 1. ดึงเฉพาะไฟล์เสียง (ไม่เกิน 1-3 MB)
+        download_audio_safe(url, temp_file)
+
+        # 2. ส่งไฟล์เสียงขึ้นไปให้ Gemini ประมวลผล
+        gemini_file = client.files.upload(file=temp_file)
+
+        # 3. สั่งให้สรุปจากเสียงพูด
+        summary = summarize_with_gemini([
+            gemini_file,
+            prompt_text
+        ])
+        return SummarizeResponse(summary=summary)
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Download/Process Error: {str(e)}")
 
     finally:
-        # ลบไฟล์ในเครื่อง Render และลบไฟล์บน Gemini เพื่อไม่ให้เปลืองพื้นที่
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-        if uploaded_file:
+        # ล้างไฟล์ชั่วคราวทิ้งทุกครั้งเพื่อประหยัด RAM/Disk
+        if os.path.exists(temp_file):
             try:
-                client.files.delete(name=uploaded_file.name)
+                os.remove(temp_file)
+            except Exception:
+                pass
+
+        if gemini_file:
+            try:
+                client.files.delete(name=gemini_file.name)
             except Exception:
                 pass
