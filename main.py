@@ -1,7 +1,10 @@
 import os
+import json
 import time
 import uuid
 import traceback
+import urllib.request
+import urllib.parse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,9 +12,8 @@ from google import genai
 from google.genai import types
 import yt_dlp
 
-app = FastAPI(title="Multi-Platform Video Summarizer API", version="2.0.0")
+app = FastAPI(title="Multi-Platform Video Summarizer API", version="2.1.0")
 
-# เปิดสิทธิ์ CORS ให้ LangMind สามารถส่งคำขอเข้ามาได้
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ดึง Gemini API Key จาก Environment Variable บน Render
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -30,11 +31,26 @@ class SummarizeRequest(BaseModel):
 class SummarizeResponse(BaseModel):
     summary: str
 
-def download_audio_safe(url: str, output_path: str):
-    """
-    ดาวน์โหลดเฉพาะเสียงจาก TikTok, Facebook, Instagram 
-    พร้อมตั้งค่า Headers เลียนแบบเบราว์เซอร์มือถือเพื่อป้องกันการบล็อก
-    """
+def download_tiktok_audio_direct(url: str, output_path: str):
+    """ดึงเสียงจาก TikTok ผ่าน TikWM เพื่อข้ามระบบบล็อก Data Center IP"""
+    api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}"
+    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+    
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+        
+    if data.get("code") == 0 and "data" in data:
+        # เลือกเอาไฟล์เสียงเพลง/เสียงพูด ถ้าไม่มีให้ดึงเสียงจากวิดีโอ
+        audio_url = data["data"].get("music") or data["data"].get("play")
+        audio_req = urllib.request.Request(audio_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(audio_req, timeout=20) as a_resp, open(output_path, 'wb') as f:
+            f.write(a_resp.read())
+        return True
+    else:
+        raise Exception(f"TikWM Error: {data.get('msg', 'Failed to fetch TikTok data')}")
+
+def download_generic_audio(url: str, output_path: str):
+    """สำหรับ Facebook, Instagram หรือแพลตฟอร์มอื่นๆ ผ่าน yt-dlp"""
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_path,
@@ -43,16 +59,13 @@ def download_audio_safe(url: str, output_path: str):
         'nocheckcertificate': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.tiktok.com/',
         },
-        'extract_flat': False,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 def summarize_with_gemini(contents_payload: list) -> str:
-    """เรียกประมวลผล Gemini พร้อมระบบสลับโมเดลอัตโนมัติหากติด 503"""
+    """ประมวลผลด้วย Gemini 3.5 Flash Lite และมีระบบ Retry"""
     models = ['gemini-3.5-flash-lite', 'gemini-3.8-flash']
     last_err = None
 
@@ -77,7 +90,7 @@ def summarize_with_gemini(contents_payload: list) -> str:
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Multi-Platform Summarizer API is running"}
+    return {"status": "ok", "message": "API is running"}
 
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize_video(req: SummarizeRequest):
@@ -88,7 +101,7 @@ def summarize_video(req: SummarizeRequest):
     url_lower = url.lower()
     prompt_text = "สรุปประเด็นสำคัญของเนื้อหานี้เป็นภาษาไทยอย่างกระชับ ชัดเจน แยกเป็นหัวข้อและข้อย่อยให้อ่านเข้าใจง่าย"
 
-    # กรณีที่ 1: เป็นคลิป YouTube (ประมวลผลผ่าน URI ได้โดยตรง ไม่ต้องโหลดไฟล์)
+    # 1. YouTube: ยิงตรงหา Gemini ทันที ไม่ต้องโหลดไฟล์
     if "youtube.com" in url_lower or "youtu.be" in url_lower:
         try:
             summary = summarize_with_gemini([
@@ -100,18 +113,20 @@ def summarize_video(req: SummarizeRequest):
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"YouTube Error: {str(e)}")
 
-    # กรณีที่ 2: TikTok, Facebook Reels, Instagram Reels
-    temp_file = f"/tmp/{uuid.uuid4()}.m4a"
+    # 2. TikTok / FB / IG: โหลดไฟล์เสียงแล้วส่งให้ Gemini
+    temp_file = f"/tmp/{uuid.uuid4()}.mp3"
     gemini_file = None
 
     try:
-        # 1. ดึงเฉพาะไฟล์เสียง (ไม่เกิน 1-3 MB)
-        download_audio_safe(url, temp_file)
+        if "tiktok.com" in url_lower:
+            download_tiktok_audio_direct(url, temp_file)
+        else:
+            download_generic_audio(url, temp_file)
 
-        # 2. ส่งไฟล์เสียงขึ้นไปให้ Gemini ประมวลผล
+        # อัปโหลดไฟล์เสียงเข้า Gemini File API
         gemini_file = client.files.upload(file=temp_file)
 
-        # 3. สั่งให้สรุปจากเสียงพูด
+        # สรุปเนื้อหาจากเสียง
         summary = summarize_with_gemini([
             gemini_file,
             prompt_text
@@ -123,13 +138,12 @@ def summarize_video(req: SummarizeRequest):
         raise HTTPException(status_code=500, detail=f"Download/Process Error: {str(e)}")
 
     finally:
-        # ล้างไฟล์ชั่วคราวทิ้งทุกครั้งเพื่อประหยัด RAM/Disk
+        # เคลียร์ไฟล์ชั่วคราว
         if os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
             except Exception:
                 pass
-
         if gemini_file:
             try:
                 client.files.delete(name=gemini_file.name)
