@@ -88,7 +88,7 @@ def summarize_with_gemini(contents_payload: list) -> str:
 
     raise last_err
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok", "message": "API is running"}
 
